@@ -19,13 +19,12 @@
 ### 1.1 Game Overview
 - **Chosen Game:** Tic-Tac-Toe
 - **Player Capacity:** 2 Players (Simulated via 2 CML Client nodes)
-- **Game Summary:** In Tic-Tac-Toe, a player is randomly chosen to go first when beginning the game, and each game after that, the losing player will go first. The player will win if they get their X or O 3 times in a row or diagonally, or 
-a tie if none gets three in a row.
+- **Game Summary:** In Tic-Tac-Toe, the goal of each player is to be able to get three in a row in a 3x3 table with X and O. It is essential for each player to pick the correct space in the table in order to win against their opponent.
 
 ### 1.2 Core Game Rules & Win/Draw Conditions
-- **Turn Mechanics:** In Tic-Tac-Toe, when both players starts playing in the first game, the first person to go will be randomly chosen. When a player wins, the player who've lost will begin their first move the next round.
-- **Victory Condition:** A player wins if they get 3 Xs or Os in a row or diagonally.
-- **Draw/Tie Condition:** if there is a tie, the player who've made their first move will begin again.
+- **Turn Mechanics:** In Tic-Tac-Toe, when both players start playing in the first game, the first person to go will be randomly chosen, and are able to choose a shape (X or O) they want for the rest of the game. When a player wins, the player who've lost will begin their first move the next round.
+- **Victory Condition:** A player wins a round if they get 3 Xs or Os in a row or diagonally. After 10 rounds, or however long two players want to go for, a player wins if they got the most amount of points. 
+- **Draw/Tie Condition:** if there is a tie, the player who began the round will start first again.
 
 ---
 
