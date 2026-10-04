@@ -32,8 +32,8 @@
 
 ### 2.1 Message Transport & Serialization Format
 - **Transport Protocol:** TCP
-- **Serialization Format:** [JSON / Fixed-Header Binary / Delimited Text]
-- **Framing Mechanism:** [e.g., Newline-delimited (`\n`) JSON payloads OR 4-byte big-endian length prefix]
+- **Serialization Format:** JSON
+- **Framing Mechanism:** Newline-delimited (`\n`) JSON payloads
 
 ### 2.2 Message Schema Definitions
 
