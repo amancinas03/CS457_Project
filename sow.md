@@ -63,14 +63,14 @@
 }
 {
     "msg_type": "CONNECT",
-    "client_host": "adrian.mancinasponce.edu",
+    "client_host": "server.mancinasponce.edu",
     "client_port": 49012
 }
 {
     "msg_type": "LOBBY_WAIT",
     "room_id": "rm-1",
     "assigned_player_id": "Player_1",
-    "server_host": "adrian.mancinasponce.edu",
+    "server_host": "server.mancinasponce.edu",
     "message": "Successfully connected to server. Waiting for Player 2..."
 }
 {
@@ -103,7 +103,7 @@
 }
 ```
 #### Example of Wire Stream
-- {"msg_type":"CONNECT","client_ip":"192.168.10.1","client_port": 49012}\n{"msg_type":"LOBBY_WAIT","room_id":"rm-1","assigned_player_id":"Player_1","server_ip":"192.168.10.1","message":"Connected to server. Waiting for Player 2..."}\n
+- {"msg_type":"CONNECT","client_host":"server.mancinasponce.edu","client_port": 49012}\n{"msg_type":"LOBBY_WAIT","room_id":"rm-1","assigned_player_id":"Player_1","server_host":"server.mancinasponce.edu","message":"Connected to server. Waiting for Player 2..."}\n
 - Each time the receiver encounters a **\n** or **\n\r**, it extracts the completed line, and deserializes that said JSON object. It will continue doing that for each newline it encounters for each messages. For this game, recv() will collect
 the messages it receives, then it is the programs job to manually extract the line after encountering a newline. 
 
