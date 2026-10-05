@@ -1,4 +1,4 @@
-#AI Prompt:
+# AI Prompt
 - Currently this is how I've gotten my AI to behave accordingly to my strict guidelines for this project. The prompt could change depending on if the AI starts going off track.
    
 -You will adhere to the rules I will show you that will help me along the way with developing my custom application layer protocol and tic tac toe game.
