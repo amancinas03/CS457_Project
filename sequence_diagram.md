@@ -15,23 +15,23 @@ sequenceDiagram
     participant Server as Game Server
     actor Player2 as Player 2 (Player O)
 
-    Player1->>Server: MOVE (row: 0, col: 2)
+    Player1->>Server: MOVE (row: 0, col: 2, Player ID: player_1)
     Note over Server: Server validates: Is it Player 1's turn?<br>Is cell (0,2) empty?
-    alt Invalid / Out of Turn Move
-        Server-->>Player1: ERROR ('Move not valid' or 'Wait for your turn')
-    else Valid Move
+    alt Valid Move
         Note over Server: Update Board & Swap Active Player to Player 2
-        Server-->>Player1: STATE_UPDATE (Board, Turn: Player 2, Turn_Status: False)
-        Server-->>Player2: STATE_UPDATE (Board, Turn: Player 2, Turn_Status: True)
+        Server-->>Player1: STATE_UPDATE (Board, Turn: Player 2, Turn Status: False, Scores: {"player_1": 0, "player_2": 0})
+        Server-->>Player2: STATE_UPDATE (Board, Turn: Player 2, Turn Status: True, Scores: {"player_1": 0, "player_2": 0})
+    else Invalid / Out of Turn Move
+        Server-->>Player1: ERROR ('Move not valid, please try again' or 'Wait for your turn')
     end
 
-    Player2->>Server: MOVE (row: 2, col: 0)
+    Player2->>Server: MOVE (row: 2, col: 0, Player ID: player_2))
     Note over Server: Server validates: Is it Player 2's turn?<br>Is cell (2,0) empty?
-    alt Invalid / Out of Turn Move
-        Server-->>Player2: ERROR ('Move not valid' or 'Wait for your turn')
-    else Valid Move
+    alt Valid Move
         Note over Server: Update Board & Swap Active Player to Player 1
-        Server-->>Player1: STATE_UPDATE (Board, Turn: Player 1, Turn_Status: True)
-        Server-->>Player2: STATE_UPDATE (Board, Turn: Player 1, Turn_Status: False)
+        Server-->>Player1: STATE_UPDATE (Board, Turn: Player 1, Turn Status: True, Scores: {"player_1": 0, "player_2": 0})
+        Server-->>Player2: STATE_UPDATE (Board, Turn: Player 1, Turn Status: False, Scores: {"player_1": 0, "player_2": 0})
+    else Invalid / Out of Turn Move
+        Server-->>Player2: ERROR ('Move not valid, please try again' or 'Wait for your turn')
     end
 ```
