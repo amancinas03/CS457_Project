@@ -81,3 +81,11 @@ the messages it receives, then it is the programs job to manually extract the li
 
 ### Game State Machine (FSM) Design
 - **State Transitions:** Detail state flow: `INIT` -> `WAITING_FOR_PLAYERS` -> `ASSIGN_ROLES` -> `GAME_START` -> `PLAYER_TURN` -> `EVALUATE_MOVE` -> `GAME_OVER` -> `CLEANUP`.
+
+### Connection Termination & Socket Lifecycle Management
+- For a graceful application disconnection, like DISCONNECT or tcp fin, the client who wants to quit will send a DISCONNECT message first to the server, to let the opponent know they won by forfeit. After that, the quitting player will do a tcp fin handshake to initiate the disconnection and go back to the lobby.
+
+- To handle TCP EOF 0 Byte rule, after the disconnection has been successfully completed, the player will check if any data will be sent such as TCP FIN. If they receive 0 bytes, or TCP FIN, from "data = socket.recv(1024), then the line "if not data:" will handle it gracefully, let the player know and send the player back to the lobby.
+
+- However, when it comes to handling ConnectionResetError, BrokenPipeError, or TimeoutError exceptions when an opponent leaves abruptly or something else happens, the code will contain the except line to catch all those three errors. With that, it allows the player to know that the Connection was lost abruptly due to three possible things. They will be declared as a winner, and just like TCP EOF, the game will send the player back to the lobby.
+
