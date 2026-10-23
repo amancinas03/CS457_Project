@@ -23,11 +23,13 @@ Since the game of tic-tac-toe only allows a maximum of two players, the server w
 2. It will then verify to see if the space is claimed or not. It will add the shape of the player to the empty space if no one has claimed it first after the verification. Finally, the server swaps the active players and sends a STATE_UPDATE to the players after leaving the shared resource space
 3. These actions will repeat until the server finds a winning 3 in a row or draw.
 ```python
-if not validate_player_id(player_id):
-  message = "ERROR: It is not your turn yet, please wait until it is your turn to make a selection"
-  clients[player_id].sendall(message.encode('utf-8'))
-  return
+data = decode_data(s.recv(1024))
+
 with game_lock:
+  if not validate_player_id(player_id):
+    message = "ERROR: It is not your turn yet, please wait until it is your turn to make a selection"
+    clients[player_id].sendall(message.encode('utf-8'))
+    return
   if not validate_empty_space(row, col):
     message = "ERROR: Space is already occupied, please make another selection"
     clients[player_id].sendall(message.encode('utf-8'))
