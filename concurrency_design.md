@@ -19,11 +19,13 @@ Since the game of tic-tac-toe only allows a maximum of two players, the server w
 ## **Synchronization Logic:** 
 - After binding the connections of both players, threading.Lock from here on out to prevent  data corruption or prohibited access from the outside that could break the game.
 - During gameplay, the server will have necessary functions and locks so that no one else enters the shared resource space, except for the server:
-1. When the server receives a message from an active player, it will first verify that the message received is the currently active player. Then, it initializes `game_lock = thread.Lock()`, and then use `with game_lock:` to ensure no one enters the shared resource and prevent any attempts of cheating or multiple users being in the shared resource space. This function will automatically acquire and release the lock due to how `with game_lock:` works.
-2. It will then verify to see if the space is claimed or not. It will add the shape of the player to the empty space if no one has claimed it first after the verification. Finally, the server swaps the active players and sends a STATE_UPDATE to the players after leaving the shared resource space
+1. When the server receives a message from an active player, it will initializes `game_lock = thread.Lock()`, and then use `with game_lock:` to ensure no one enters the shared resource and prevent any attempts of cheating or multiple users being in the shared resource space. This function will automatically acquire and release the lock due to how `with game_lock:` works.
+2. First, it will verify that the message received is the currently active player, then verifies to see if the space is claimed or not. It will add the shape of the player to the empty space if no one has claimed it first after the verification. Finally, the server swaps the active players and sends a STATE_UPDATE to the players after leaving the shared resource space
 3. These actions will repeat until the server finds a winning 3 in a row or draw.
+- Here's an example of how the code could look:
 ```python
 data = decode_data(s.recv(1024))
+game_lock = thread.Lock()
 
 with game_lock:
   if not validate_player_id(player_id):
