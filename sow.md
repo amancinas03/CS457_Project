@@ -123,12 +123,17 @@ the messages it receives, then it is the programs job to manually extract the li
 ## 3. Game Behavior & Server Concurrency Architecture (Sprint 2 Deliverable)
 
 ### 3.1 Server Concurrency Strategy
-- **Architecture Choice:** [Multi-Threading (`threading.Thread`) OR Non-blocking I/O multiplexing (`select.select` / `selectors`)]
-- **Synchronization Logic:** Explain how shared game state and client list are thread-safe (e.g. `threading.Lock`) to prevent race conditions during turn processing.
+- **Architecture Choice:** Multi-Threading (`threading.Thread`)
+- **Synchronization Logic:** 
+- The game will be utilizing multi-threading to prevent any race conditions, for example, two clients entering the shared resource and making changes, or a player attempting to cheat. The server will initiate the locking sequence to prevent anyone from entering the critical space by utilizing threading.Lock, or for example, game_lock = thread.Lock(). The server will enter the critical space by utilizing with game_lock:. It will do a verification check first to see if the player that sent the move is the current player, then it checks if the space is free. Finally, it will update the board, check if there is a game winning row, or swap next player and exit the critical space. For more information on multi-threading, look in concurrency_design.md.
 
 ### 3.2 State & Score Synchronization Across Clients
-- **Turn Enforcement:** Detail how the server validates active player ID before processing moves and broadcasts updated turn notifications to all clients.
-- **Score & Board Synchronization:** Describe how state broadcasts keep client screens synchronized in real time.
+- **Turn Enforcement:**
+- Each player will contain a unique ID assigned by the server itself instead of the user, to identify the first and second player (ex. player1) instead of by name.
+  The server will keep track of which ID is active at the moment. The active player will make their move, and then send their ID alongside their move to the server. The server will then compare the ID sent by the player with the ID it is currently tracking (if curr_player_id == player.player_id).
+  If true, then the server will validate the move (if validateselection(row, col)). If successful, the server will record the move, and then switch to the next player.
+- **Score & Board Synchronization:**
+- The server will hold the most up to date board and after each time a move has been made, it will display the board to all players when loading the Json with json.loads() in a STATE_UPDATE each times. Just like updating the board, it will also swap in the next player to make their move after the previous player, and it will also be sent with the updated board. Since this game will utilize the JSON framing structure, the data will come as a JSON string. as soon as they received a STATE_UPDATE from the server, their boards will be updated to the most recent updated board made by the server. The server will also keep track of scores of both clients connected to the server. When a client wins a game, their scores will be tallied up and the server will send a STATE_UPDATE at the round over screen, showing the current scores of both players and who has the most. It will keep doing that in each round when it ends. These are the ways that the server will make sure clients will stay synchronized with one another.
 
 ---
 
