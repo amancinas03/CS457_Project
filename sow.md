@@ -139,9 +139,9 @@ the messages it receives, then it is the programs job to manually extract the li
 
 ## 4. Coding & AI Implementation Plan (Sprint 3)
 
-- **Permitted AI Tools:** [e.g., GitHub Copilot, ChatGPT, Claude]
-- **AI Prompting & Constraint Strategy:** Explain how you will constrain AI models to generate code (in Python or your chosen language) that adheres strictly to the protocol blueprint and FSM designed in Sprints 1 & 2.
-- **Implementation Risk Management:** Detail your plan to leverage past programming experience and manage time to ensure code completion on schedule.
+- **Permitted AI Tools:** Gemini Argon (High Thinking)
+- **AI Prompting & Constraint Strategy:** I will give the AI instructions on what to do and what not to do in order for it to adhere to my diagrams only. I will first give it my instructions on what they need to follow, then give the AI my diagram, what my plan is, the fsm specifications along with the sequence diagram, and what kind of things will be used to prevent players from corrupting or changing files in the server. 
+- **Implementation Risk Management:** Since AI can always make a really good code, but fails to make any bug fixes on the first try, I will use my past programming to ensure that the code is fully functional. I will let it generate the code, then I will test every edge case when it comes to normal gameplay. If I were to find anything that isn't functioning properly, then I'll give a screenshot to the AI to tell it to fix the bug, and once that is fixed, I'll test it again. I will also inspect through the entire code to make sure that it adheres to my diagram and if there is anything that is off or missing, I'll ask the AI to code it in if possible.
 
 ---
 
