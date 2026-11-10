@@ -7,27 +7,32 @@ import time
 
 
 def parse_args():
-    """Parses CLI arguments for the client (-h, -i, -p)."""
+    """Parses and validates CLI arguments for the client (-h, -i, -p)."""
     parser = argparse.ArgumentParser(
         description="Tic-Tac-Toe TCP Game Client"
     )
     parser.add_argument(
         "-i",
         dest="hostname",
+        metavar="<server_hostname_or_ip>",
         required=True,
         help=(
-            "Server DNS hostname (required; resolved via "
+            "Server DNS hostname or IP (required; resolved via "
             "socket.gethostbyname())."
         ),
     )
     parser.add_argument(
         "-p",
         dest="port",
+        metavar="<port>",
         type=int,
         required=True,
-        help="Server port (required).",
+        help="Server port (required; range 1024-65535).",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not (1024 <= args.port <= 65535):
+        parser.error("Port number (-p) must be in the range 1024-65535.")
+    return args
 
 
 def send_json(sock, data):
