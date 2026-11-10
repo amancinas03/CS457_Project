@@ -30,18 +30,22 @@ match_done_event = threading.Event()
 
 
 def parse_args():
-    """Parses CLI arguments for the server (-h, -p)."""
+    """Parses and validates CLI arguments for the server (-h, -p)."""
     parser = argparse.ArgumentParser(
         description="Tic-Tac-Toe TCP Game Server"
     )
     parser.add_argument(
         "-p",
         dest="port",
+        metavar="<port>",
         type=int,
         required=True,
-        help="Listening port (required; binds to 0.0.0.0)."
+        help="Listening port (required; range 1024-65535; binds to 0.0.0.0).",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not (1024 <= args.port <= 65535):
+        parser.error("Port number (-p) must be in the range 1024-65535.")
+    return args
 
 
 def get_overall_winner_text(scores_dict):
@@ -587,7 +591,8 @@ def process_message(player_id, msg):
                 active_player = "player_1"
 
             game_state = "PLAYER_TURN"
-            send_state_update()
+
+        send_state_update()
         return
 
     # 5. RESTART message (Rematch voting in GAME_OVER state)
