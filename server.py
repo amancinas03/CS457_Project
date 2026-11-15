@@ -1,777 +1,598 @@
+"""
+Multi-Threaded TCP Tic-Tac-Toe Server (Sprint 3).
+Implements newline-delimited JSON framing, FSM game logic, thread-safe state
+synchronization, and turn-aware 30-second AFK timeout enforcement.
+"""
+
 import argparse
 import json
 import random
 import socket
+import sys
 import threading
 import time
 
-# Default protocol constants
 IP_ADDR = "0.0.0.0"
-SERVER_HOSTNAME_LABEL = "server.mancinasponce.edu"
-ROOM_ID = "rm-1"
-TURN_TIMEOUT = 30.0  # 30-second disconnect/forfeit timeout per FSM diagram
+TURN_TIMEOUT = 30.0
 
-# Shared resources protected by game_lock
-game_lock = threading.Lock()
-clients = {}          # {"player_1": socket, "player_2": socket}
-client_buffers = {}   # {"player_1": "", "player_2": ""}
-points = {"player_1": 0, "player_2": 0}
-player_shapes = {}    # {"player_1": "X", "player_2": "O"}
-rematch_votes = set()
+WINNING_LINES = [
+    [(0, 0), (0, 1), (0, 2)],
+    [(1, 0), (1, 1), (1, 2)],
+    [(2, 0), (2, 1), (2, 2)],
+    [(0, 0), (1, 0), (2, 0)],
+    [(0, 1), (1, 1), (2, 1)],
+    [(0, 2), (1, 2), (2, 2)],
+    [(0, 0), (1, 1), (2, 2)],
+    [(0, 2), (1, 1), (2, 0)],
+]
 
-board = [["", "", ""], ["", "", ""], ["", "", ""]]
-game_state = "INIT"
-active_player = None
-player_go_first = None
-last_loser = None
-
-# Event used to coordinate lobby resets when a match concludes
+state_lock = threading.Lock()
 match_done_event = threading.Event()
+
+game_state = {
+    "state": "WAITING_FOR_PLAYERS",
+    "players": {},
+    "roles": {},
+    "board": [[" " for _ in range(3)] for _ in range(3)],
+    "active_turn": None,
+    "next_first_player": None,
+    "scores": {"player_1": 0, "player_2": 0},
+    "rematch_votes": {},
+    "turn_start_time": 0.0,
+}
+
+
+def validate_port(value):
+    """Validate that the port number is an integer between 1024 and 65535."""
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Invalid port '{value}'. Must be an integer."
+        ) from exc
+    if not 1024 <= port <= 65535:
+        raise argparse.ArgumentTypeError(
+            f"Port {port} out of range. Choose between 1024 and 65535."
+        )
+    return port
 
 
 def parse_args():
-    """Parses and validates CLI arguments for the server (-h, -p)."""
+    """Parse command-line arguments for the Tic-Tac-Toe server."""
     parser = argparse.ArgumentParser(
-        description="Tic-Tac-Toe TCP Game Server"
+        description="TCP Tic-Tac-Toe Game Server."
     )
     parser.add_argument(
         "-p",
-        dest="port",
-        metavar="<port>",
-        type=int,
+        "--port",
+        type=validate_port,
         required=True,
-        help="Listening port (required; range 1024-65535; binds to 0.0.0.0).",
+        help="TCP port to listen on (1024-65535).",
     )
-    args = parser.parse_args()
-    if not (1024 <= args.port <= 65535):
-        parser.error("Port number (-p) must be in the range 1024-65535.")
-    return args
-
-
-def get_overall_winner_text(scores_dict):
-    """Determines the overall winner based on whoever has the most points."""
-    p1 = scores_dict.get("player_1", 0)
-    p2 = scores_dict.get("player_2", 0)
-    if p1 > p2:
-        return f"player_1 Wins Overall ({p1} to {p2})"
-    if p2 > p1:
-        return f"player_2 Wins Overall ({p2} to {p1})"
-    return f"Match Tied ({p1} to {p2})"
+    return parser.parse_args()
 
 
 def send_json(sock, payload):
-    """Serializes dictionary to JSON and appends a newline delimiter (\\n)."""
-    raw_msg = json.dumps(payload) + "\n"
-    sock.sendall(raw_msg.encode("utf-8"))
+    """Serialize payload to JSON with newline delimiter and send over TCP."""
+    try:
+        data = (json.dumps(payload) + "\n").encode("utf-8")
+        sock.sendall(data)
+    except OSError:
+        pass
 
 
-def broadcast_json(payload):
-    """Sends a single JSON message to all currently connected players."""
-    for _, sock in list(clients.items()):
-        try:
-            send_json(sock, payload)
-        except (
-            ConnectionResetError,
-            ConnectionAbortedError,
-            BrokenPipeError,
-            TimeoutError,
-            OSError,
-        ):
-            pass
-
-
-def send_state_update(message_text=None):
-    """
-    Sends personalized STATE_UPDATE to each player matching the sequence
-    diagram: Board, Turn (active_player), Turn Status (turn: True/False),
-    and Scores.
-    """
-    for pid, sock in list(clients.items()):
-        is_turn = (game_state == "PLAYER_TURN") and (pid == active_player)
-        msg = message_text or (
-            f"{active_player}, please make your move."
-            if is_turn
-            else f"Waiting for {active_player} to make a move..."
-        )
-        payload = {
-            "msg_type": "STATE_UPDATE",
-            "board": board,
-            "active_player": active_player,
-            "turn": is_turn,
-            "scores": points,
-            "message": msg,
-            "timestamp": int(time.time()),
-        }
-        try:
-            send_json(sock, payload)
-        except (
-            ConnectionResetError,
-            ConnectionAbortedError,
-            BrokenPipeError,
-            TimeoutError,
-            OSError,
-        ):
-            pass
-
-
-def recv_json_lines(player_id, sock):
-    """
-    Reads from TCP stream and manually extracts newline-delimited
-    (\\n or \\r\\n) JSON messages. Returns a list of parsed dicts, or
-    None on 0-byte EOF.
-    """
-    data = sock.recv(1024)
-    if not data:
-        return None  # TCP EOF (0 bytes)
-
-    client_buffers[player_id] += data.decode("utf-8")
-    messages = []
-
-    while "\n" in client_buffers[player_id]:
-        line, client_buffers[player_id] = (
-            client_buffers[player_id].split("\n", 1)
-        )
-        line = line.rstrip("\r").strip()
-        if line:
-            try:
-                messages.append(json.loads(line))
-            except json.JSONDecodeError:
-                send_json(
-                    sock,
-                    {
-                        "msg_type": "ERROR",
-                        "message": "ERROR: Malformed JSON packet.",
-                    },
-                )
-    return messages
-
-
-def validate_player_id(player_id):
-    """Checks if the player making the move is the active player."""
-    return player_id == active_player
-
-
-def validate_empty_space(row, col):
-    """Validates board boundaries and checks that the target cell is empty."""
-    if not isinstance(row, int) or not isinstance(col, int):
-        return False
-    if row < 0 or row > 2 or col < 0 or col > 2:
-        return False
-    return board[row][col] == ""
-
-
-def check_winner(b):
-    """Checks rows, columns, and diagonals for a winning 3-in-a-row."""
-    lines = [
-        # Rows
-        [b[0][0], b[0][1], b[0][2]],
-        [b[1][0], b[1][1], b[1][2]],
-        [b[2][0], b[2][1], b[2][2]],
-        # Columns
-        [b[0][0], b[1][0], b[2][0]],
-        [b[0][1], b[1][1], b[2][1]],
-        [b[0][2], b[1][2], b[2][2]],
-        # Diagonals
-        [b[0][0], b[1][1], b[2][2]],
-        [b[0][2], b[1][1], b[2][0]],
-    ]
-    for line in lines:
-        if line[0] != "" and line[0] == line[1] == line[2]:
-            return True
-    return False
-
-
-def draw(b):
-    """Returns True if all cells are filled and no winner exists."""
-    return all(cell != "" for row in b for cell in row)
+def broadcast(payload):
+    """Send a JSON payload to all currently connected players."""
+    for sock in list(game_state["players"].values()):
+        send_json(sock, payload)
 
 
 def reset_board():
-    """Resets the 3x3 board for a new game."""
-    global board
-    board = [["", "", ""], ["", "", ""], ["", "", ""]]
+    """Return an empty 3x3 Tic-Tac-Toe board."""
+    return [[" " for _ in range(3)] for _ in range(3)]
 
 
-def handle_disconnect(
-    disconnected_pid,
-    reason="abruptly disconnected",
-    graceful_forfeit=False,
-):
-    """
-    Handles sudden disconnections (EOF, ConnectionResetError,
-    BrokenPipeError, TimeoutError) or graceful DISCONNECT messages across
-    all FSM phases, displaying the final winner before CLEANUP.
-    """
-    global game_state
-    with game_lock:
-        if game_state == "CLEANUP":
-            return
+def reset_match_state():
+    """Reset the global game_state dictionary for a new lobby session."""
+    game_state["state"] = "WAITING_FOR_PLAYERS"
+    game_state["players"].clear()
+    game_state["roles"].clear()
+    game_state["board"] = reset_board()
+    game_state["active_turn"] = None
+    game_state["next_first_player"] = None
+    game_state["scores"] = {"player_1": 0, "player_2": 0}
+    game_state["rematch_votes"].clear()
+    game_state["turn_start_time"] = 0.0
 
-        other_pid = (
-            "player_2" if disconnected_pid == "player_1" else "player_1"
-        )
-        other_sock = clients.get(other_pid)
-        disc_sock = clients.get(disconnected_pid)
 
-        # 1. Disconnect during setup/shape assignment phase
-        if game_state in (
-            "WAITING_FOR_PLAYERS",
-            "ASSIGN_ROLES",
-            "GAME_START",
-        ):
-            game_state = "CLEANUP"
-            if other_sock:
-                try:
-                    send_json(
-                        other_sock,
-                        {
-                            "msg_type": "ERROR",
-                            "message": (
-                                f"{disconnected_pid} disconnected during "
-                                f"setup ({reason}). Returning to lobby."
-                            ),
-                        },
-                    )
-                except OSError:
-                    pass
+def check_winner(board):
+    """Return the winning shape ('X' or 'O') if a line is complete, else None."""
+    for line in WINNING_LINES:
+        vals = [board[r][c] for r, c in line]
+        if vals[0] != " " and vals[0] == vals[1] == vals[2]:
+            return vals[0]
+    return None
 
-        # 2. Disconnect or forfeit during active gameplay
-        elif game_state in ("PLAYER_TURN", "EVALUATE_MOVE"):
-            game_state = "GAME_OVER"
-            if other_pid in points:
-                points[other_pid] += 1
-            overall_winner = get_overall_winner_text(points)
-            if other_sock:
-                try:
-                    if graceful_forfeit:
-                        forfeit_msg = (
-                            f"{disconnected_pid} forfeited the game. "
-                            f"{other_pid} wins by forfeit! "
-                            f"Final Winner: {overall_winner}. "
-                            "Returning to lobby."
-                        )
-                    else:
-                        forfeit_msg = (
-                            f"Connection to {disconnected_pid} lost "
-                            f"({reason}). {other_pid} wins automatically! "
-                            f"Final Winner: {overall_winner}. "
-                            "Returning to lobby."
-                        )
-                    send_json(
-                        other_sock,
-                        {
-                            "msg_type": "GAME_OVER",
-                            "final": True,
-                            "results": (
-                                f"{other_pid} Wins by Forfeit | "
-                                f"{overall_winner}"
-                            ),
-                            "scores": points,
-                            "message": forfeit_msg,
-                        },
-                    )
-                except OSError:
-                    pass
-            game_state = "CLEANUP"
 
-        # 3. Disconnect during GAME_OVER (player declined rematch)
-        elif game_state == "GAME_OVER":
-            game_state = "CLEANUP"
-            overall_winner = get_overall_winner_text(points)
-            final_payload = {
-                "msg_type": "GAME_OVER",
-                "final": True,
-                "results": overall_winner,
-                "scores": points,
+def is_board_full(board):
+    """Return True if no empty spaces remain on the board."""
+    return all(cell != " " for row in board for cell in row)
+
+
+def format_overall_winner(scores):
+    """Format the overall match winner string based on final scores."""
+    s1 = scores["player_1"]
+    s2 = scores["player_2"]
+    if s1 > s2:
+        return f"player_1 (Most Points: {s1} to {s2})"
+    if s2 > s1:
+        return f"player_2 (Most Points: {s2} to {s1})"
+    return f"Tie Match ({s1} to {s2})"
+
+
+def start_shape_selection():
+    """Select the starting player (loser of last round, or random) to pick X/O."""
+    if game_state.get("next_first_player") in ("player_1", "player_2"):
+        first_player = game_state["next_first_player"]
+    else:
+        first_player = random.choice(["player_1", "player_2"])
+
+    waiting_player = "player_2" if first_player == "player_1" else "player_1"
+
+    game_state["state"] = "CHOOSE_SHAPE"
+    game_state["board"] = reset_board()
+    game_state["roles"].clear()
+    game_state["rematch_votes"].clear()
+    game_state["active_turn"] = first_player
+    game_state["turn_start_time"] = time.time()
+
+    first_sock = game_state["players"].get(first_player)
+    wait_sock = game_state["players"].get(waiting_player)
+
+    if first_sock:
+        send_json(
+            first_sock,
+            {
+                "type": "GAME_START",
+                "board": game_state["board"],
+                "active_turn": first_player,
+                "choose_shape": True,
                 "message": (
-                    f"{disconnected_pid} declined the rematch. "
-                    f"Match concluded! Final Winner: {overall_winner}. "
-                    "Returning to lobby."
+                    f"{first_player} goes first. "
+                    "Please select your shape (X or O)"
                 ),
-            }
-            for target_sock in (other_sock, disc_sock):
-                if target_sock:
-                    try:
-                        send_json(target_sock, final_payload)
-                    except OSError:
-                        pass
+            },
+        )
+    if wait_sock:
+        send_json(
+            wait_sock,
+            {
+                "type": "GAME_START",
+                "board": game_state["board"],
+                "active_turn": first_player,
+                "choose_shape": False,
+                "message": (
+                    f"{first_player} goes first and is selecting "
+                    "their shape (X or O). Please wait..."
+                ),
+            },
+        )
 
-        else:
-            game_state = "CLEANUP"
 
-        cleanup_session_locked()
+def handle_forfeit(leaver_id, reason_text, is_afk=False):
+    """Award forfeit win to the remaining player and close match sockets."""
+    if game_state["state"] == "GAME_OVER":
+        return
 
+    game_state["state"] = "GAME_OVER"
+    opponent_id = "player_2" if leaver_id == "player_1" else "player_1"
+    game_state["scores"][opponent_id] += 1
 
-def cleanup_session_locked():
-    """
-    Half-closes write side (TCP FIN) first so the remaining client can read
-    the final ERROR or GAME_OVER packet without receiving a TCP RST, then
-    closes all sockets.
-    """
-    sockets_to_close = list(clients.values())
-    for sock in sockets_to_close:
-        try:
-            sock.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
+    scores = dict(game_state["scores"])
+    final_winner = format_overall_winner(scores)
 
-    # Brief pause to allow final packet delivery before closing descriptor
-    time.sleep(0.15)
+    leaver_sock = game_state["players"].get(leaver_id)
+    opponent_sock = game_state["players"].get(opponent_id)
 
-    for sock in sockets_to_close:
+    if is_afk and leaver_sock:
+        send_json(
+            leaver_sock,
+            {
+                "type": "GAME_OVER",
+                "scores": scores,
+                "final_winner": final_winner,
+                "message": (
+                    "[AFK] You went AFK for over 30 seconds and have been "
+                    f"kicked from the lobby. {opponent_id} wins by forfeit!"
+                ),
+            },
+        )
+
+    if opponent_sock:
+        send_json(
+            opponent_sock,
+            {
+                "type": "GAME_OVER",
+                "scores": scores,
+                "final_winner": final_winner,
+                "message": (
+                    f"Connection to {leaver_id} lost ({reason_text}). "
+                    f"{opponent_id} wins automatically! "
+                    f"Final Winner: {final_winner}. Returning to lobby."
+                ),
+            },
+        )
+
+    for sock in list(game_state["players"].values()):
         try:
             sock.close()
         except OSError:
             pass
 
-    clients.clear()
-    client_buffers.clear()
-    player_shapes.clear()
-    rematch_votes.clear()
-    reset_board()
     match_done_event.set()
 
 
-def start_assignment_phase():
-    """Transitions from WAITING_FOR_PLAYERS -> ASSIGN_ROLES -> GAME_START."""
-    global game_state, player_go_first, active_player
-    with game_lock:
-        game_state = "ASSIGN_ROLES"
-        reset_board()
-        player_shapes.clear()
-        rematch_votes.clear()
-
-        # On rematch after a win, losing player goes first; else random
-        if last_loser in ("player_1", "player_2"):
-            player_go_first = last_loser
-        else:
-            player_go_first = random.choice(list(clients.keys()))
-
-        active_player = player_go_first
-        game_state = "GAME_START"
-
-        for pid, sock in list(clients.items()):
-            if pid == player_go_first:
-                msg = (
-                    f"{player_go_first} goes first. "
-                    "Please select your shape (X or O)"
-                )
-            else:
-                msg = (
-                    f"{player_go_first} goes first and is selecting "
-                    "their shape (X or O). Please wait..."
-                )
-            send_json(
-                sock,
-                {
-                    "msg_type": "GAME_START",
-                    "board": board,
-                    "player_go_first": player_go_first,
-                    "message": msg,
-                },
-            )
-
-
 def process_message(player_id, msg):
-    """Processes a single deserialized JSON message according to the FSM."""
-    global game_state, active_player, last_loser
+    """Process a single decoded JSON message inside the state_lock mutex."""
+    msg_type = msg.get("type")
+    state = game_state["state"]
+    player_sock = game_state["players"].get(player_id)
+    opponent_id = "player_2" if player_id == "player_1" else "player_1"
 
-    msg_type = msg.get("msg_type")
-    sock = clients.get(player_id)
-    if not sock:
+    if msg_type == "QUIT":
+        handle_forfeit(player_id, "Player quit / forfeited", is_afk=False)
         return
 
-    # 1. CONNECT message
-    if msg_type == "CONNECT":
-        with game_lock:
-            host_label = msg.get("client_host", SERVER_HOSTNAME_LABEL)
-            if len(clients) < 2:
-                wait_msg = (
-                    "Successfully connected to server. "
-                    "Waiting for Player 2..."
-                )
-            else:
-                wait_msg = "Both players connected. Initializing game..."
-
+    if state == "CHOOSE_SHAPE" and msg_type == "SHAPE_CHOICE":
+        if game_state["active_turn"] != player_id:
             send_json(
-                sock,
-                {
-                    "msg_type": "LOBBY_WAIT",
-                    "room_id": ROOM_ID,
-                    "assigned_player_id": player_id,
-                    "server_host": host_label,
-                    "message": wait_msg,
-                },
+                player_sock,
+                {"type": "ERROR", "message": "Not your turn to pick a shape."},
             )
-        return
+            return
 
-    # 2. DISCONNECT message (forfeit in gameplay or decline in GAME_OVER)
-    if msg_type == "DISCONNECT":
-        handle_disconnect(
-            player_id,
-            reason="client sent DISCONNECT",
-            graceful_forfeit=True,
+        choice = str(msg.get("shape", "")).strip().upper()
+        if choice not in ("X", "O"):
+            send_json(
+                player_sock,
+                {"type": "ERROR", "message": "Shape must be 'X' or 'O'."},
+            )
+            return
+
+        other_shape = "O" if choice == "X" else "X"
+        game_state["roles"][player_id] = choice
+        game_state["roles"][opponent_id] = other_shape
+        game_state["state"] = "IN_PROGRESS"
+        game_state["turn_start_time"] = time.time()
+
+        p1_role = game_state["roles"]["player_1"]
+        p2_role = game_state["roles"]["player_2"]
+        broadcast(
+            {
+                "type": "STATE_UPDATE",
+                "board": game_state["board"],
+                "scores": game_state["scores"],
+                "active_turn": player_id,
+                "message": (
+                    f"Roles assigned: player_1 is {p1_role}, "
+                    f"player_2 is {p2_role}. "
+                    f"{player_id}, please make your move."
+                ),
+            }
         )
         return
 
-    # 3. ROLE selection during GAME_START
-    if msg_type == "ROLE":
-        with game_lock:
-            if game_state != "GAME_START":
-                send_json(
-                    sock,
-                    {
-                        "msg_type": "ERROR",
-                        "message": (
-                            "ERROR: Role selection is not currently active."
-                        ),
-                    },
-                )
-                return
-
-            if player_id != player_go_first:
-                send_json(
-                    sock,
-                    {
-                        "msg_type": "ERROR",
-                        "message": (
-                            "ERROR: Wait for your turn to select a shape."
-                        ),
-                    },
-                )
-                return
-
-            chosen_shape = str(msg.get("shape", "")).strip().upper()
-            if chosen_shape not in ("X", "O"):
-                send_json(
-                    sock,
-                    {
-                        "msg_type": "ERROR",
-                        "message": (
-                            "ERROR: Invalid shape choice. "
-                            "Please choose 'X' or 'O'."
-                        ),
-                    },
-                )
-                send_json(
-                    sock,
-                    {
-                        "msg_type": "GAME_START",
-                        "board": board,
-                        "player_go_first": player_go_first,
-                        "message": (
-                            f"{player_go_first} goes first. "
-                            "Please select your shape (X or O)"
-                        ),
-                    },
-                )
-                return
-
-            other_pid = "player_2" if player_id == "player_1" else "player_1"
-            other_shape = "O" if chosen_shape == "X" else "X"
-            player_shapes[player_id] = chosen_shape
-            player_shapes[other_pid] = other_shape
-
-            game_state = "PLAYER_TURN"
-            active_player = player_go_first
-
-            send_state_update(
-                f"Roles assigned: {player_id} is {chosen_shape}, "
-                f"{other_pid} is {other_shape}. "
-                f"{active_player}, please make your move."
+    if state == "IN_PROGRESS" and msg_type == "MOVE":
+        if game_state["active_turn"] != player_id:
+            send_json(
+                player_sock,
+                {"type": "ERROR", "message": "Wait for your turn!"},
             )
+            return
+
+        try:
+            row = int(msg.get("row"))
+            col = int(msg.get("col"))
+        except (TypeError, ValueError):
+            send_json(
+                player_sock,
+                {"type": "ERROR", "message": "Coordinates must be integers."},
+            )
+            return
+
+        if not (0 <= row <= 2 and 0 <= col <= 2):
+            send_json(
+                player_sock,
+                {
+                    "type": "ERROR",
+                    "message": "Coordinates out of bounds (0-2).",
+                },
+            )
+            return
+
+        if game_state["board"][row][col] != " ":
+            send_json(
+                player_sock,
+                {"type": "ERROR", "message": "Cell is already occupied!"},
+            )
+            return
+
+        shape = game_state["roles"][player_id]
+        game_state["board"][row][col] = shape
+
+        winning_shape = check_winner(game_state["board"])
+        if winning_shape:
+            game_state["scores"][player_id] += 1
+            game_state["state"] = "REMATCH_WAIT"
+            game_state["next_first_player"] = opponent_id
+            game_state["turn_start_time"] = time.time()
+            leader = format_overall_winner(game_state["scores"])
+            broadcast(
+                {
+                    "type": "ROUND_OVER",
+                    "board": game_state["board"],
+                    "scores": game_state["scores"],
+                    "leader": leader,
+                    "message": (
+                        f"{player_id} ({shape}) wins this round!"
+                    ),
+                }
+            )
+            return
+
+        if is_board_full(game_state["board"]):
+            game_state["state"] = "REMATCH_WAIT"
+            game_state["next_first_player"] = None
+            game_state["turn_start_time"] = time.time()
+            leader = format_overall_winner(game_state["scores"])
+            broadcast(
+                {
+                    "type": "ROUND_OVER",
+                    "board": game_state["board"],
+                    "scores": game_state["scores"],
+                    "leader": leader,
+                    "message": "Round ended in a Draw!",
+                }
+            )
+            return
+
+        game_state["active_turn"] = opponent_id
+        game_state["turn_start_time"] = time.time()
+        broadcast(
+            {
+                "type": "STATE_UPDATE",
+                "board": game_state["board"],
+                "scores": game_state["scores"],
+                "active_turn": opponent_id,
+                "message": (
+                    f"{player_id} placed {shape} at ({row}, {col}). "
+                    f"{opponent_id}, please make your move."
+                ),
+            }
+        )
         return
 
-    # 4. PLAYER_TURN (or MOVE per sequence diagram)
-    if msg_type in ("PLAYER_TURN", "MOVE"):
-        with game_lock:
-            if game_state != "PLAYER_TURN":
-                send_json(
-                    sock,
-                    {
-                        "msg_type": "ERROR",
-                        "message": (
-                            "ERROR: Game is not currently in the "
-                            "PLAYER_TURN state."
-                        ),
-                    },
-                )
-                return
+    if state == "REMATCH_WAIT" and msg_type == "REMATCH":
+        vote = str(msg.get("vote", "")).strip().lower()
+        game_state["rematch_votes"][player_id] = vote
 
-            game_state = "EVALUATE_MOVE"
+        if vote in ("no", "n"):
+            game_state["state"] = "GAME_OVER"
+            scores = dict(game_state["scores"])
+            final_winner = format_overall_winner(scores)
+            broadcast(
+                {
+                    "type": "GAME_OVER",
+                    "scores": scores,
+                    "final_winner": final_winner,
+                    "message": (
+                        f"{player_id} declined a rematch. "
+                        "Returning to lobby."
+                    ),
+                }
+            )
+            for sock in list(game_state["players"].values()):
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            match_done_event.set()
+            return
 
-            sent_pid = msg.get("player_id", player_id)
-            if (
-                not validate_player_id(sent_pid)
-                or not validate_player_id(player_id)
-            ):
-                game_state = "PLAYER_TURN"
-                send_json(
-                    sock,
-                    {
-                        "msg_type": "ERROR",
-                        "message": "Wait for your turn",
-                    },
-                )
-                return
-
-            payload = msg.get("payload", {})
-            row = payload.get("row", msg.get("row"))
-            col = payload.get("col", msg.get("col"))
-
-            if not validate_empty_space(row, col):
-                game_state = "PLAYER_TURN"
-                send_json(
-                    sock,
-                    {
-                        "msg_type": "ERROR",
-                        "message": "Move not valid, please try again",
-                    },
-                )
-                return
-
-            # Record valid move on the shared board
-            board[row][col] = player_shapes[player_id]
-
-            # Evaluate win or draw
-            if check_winner(board):
-                game_state = "GAME_OVER"
-                points[player_id] += 1
-                last_loser = (
-                    "player_2" if player_id == "player_1" else "player_1"
-                )
-                active_player = None
-                leader_text = get_overall_winner_text(points)
-                p_shape = player_shapes[player_id]
-                send_state_update(
-                    f"{player_id} ({p_shape}) placed at "
-                    f"({row}, {col}) and won!"
-                )
-                broadcast_json(
-                    {
-                        "msg_type": "GAME_OVER",
-                        "final": False,
-                        "results": (
-                            f"{player_id} Wins Round! "
-                            f"(Leader: {leader_text})"
-                        ),
-                        "scores": points,
-                        "message": (
-                            f"{player_id} won the round! "
-                            f"Scores: {points}. Rematch? (yes/no)"
-                        ),
-                    }
-                )
-                return
-
-            if draw(board):
-                game_state = "GAME_OVER"
-                last_loser = None
-                active_player = None
-                leader_text = get_overall_winner_text(points)
-                send_state_update("Board is full!")
-                broadcast_json(
-                    {
-                        "msg_type": "GAME_OVER",
-                        "final": False,
-                        "results": f"Draw (Leader: {leader_text})",
-                        "scores": points,
-                        "message": (
-                            "Game ended in a Draw. No points awarded "
-                            "to any player. Rematch? (yes/no)"
-                        ),
-                    }
-                )
-                return
-
-            # Swap active player and return to PLAYER_TURN
-            if active_player == "player_1":
-                active_player = "player_2"
-            else:
-                active_player = "player_1"
-
-            game_state = "PLAYER_TURN"
-
-        send_state_update()
-        return
-
-    # 5. RESTART message (Rematch voting in GAME_OVER state)
-    if msg_type == "RESTART":
-        need_restart = False
-        with game_lock:
-            if game_state != "GAME_OVER":
-                overall_winner = get_overall_winner_text(points)
-                send_json(
-                    sock,
-                    {
-                        "msg_type": "GAME_OVER",
-                        "final": True,
-                        "results": overall_winner,
-                        "scores": points,
-                        "message": (
-                            "Opponent declined the rematch. "
-                            f"Final Winner: {overall_winner}. "
-                            "Returning to lobby."
-                        ),
-                    },
-                )
-                return
-
-            rematch_votes.add(player_id)
-            if len(rematch_votes) < 2:
-                send_json(
-                    sock,
-                    {
-                        "msg_type": "LOBBY_WAIT",
-                        "room_id": ROOM_ID,
-                        "assigned_player_id": player_id,
-                        "server_host": SERVER_HOSTNAME_LABEL,
-                        "message": (
-                            "Rematch accepted. "
-                            "Waiting for opponent's decision..."
-                        ),
-                    },
-                )
-            else:
-                need_restart = True
-
-        if need_restart:
-            start_assignment_phase()
-        return
-
-    # Unknown message type
-    send_json(
-        sock,
-        {
-            "msg_type": "ERROR",
-            "message": f"ERROR: Unrecognized msg_type '{msg_type}'.",
-        },
-    )
+        if len(game_state["rematch_votes"]) == 2:
+            start_shape_selection()
+        else:
+            game_state["turn_start_time"] = time.time()
+            send_json(
+                player_sock,
+                {
+                    "type": "INFO",
+                    "message": f"Waiting for {opponent_id}'s rematch vote...",
+                },
+            )
 
 
-def handle_client(client_socket, client_address, player_id):
-    """Thread worker bound to a single connected player."""
-    client_socket.settimeout(TURN_TIMEOUT)
+def handle_client(client_socket, player_id):
+    """Dedicated worker thread managing a connected player's TCP stream."""
+    client_socket.settimeout(1.0)
+    buffer = ""
+
     try:
         while not match_done_event.is_set():
             try:
-                messages = recv_json_lines(player_id, client_socket)
-            except TimeoutError:
-                # If waiting for second player in lobby, keep waiting
-                with game_lock:
-                    if game_state == "WAITING_FOR_PLAYERS":
-                        continue
-                print(
-                    f"[SERVER] {player_id} timed out after {TURN_TIMEOUT}s."
-                )
-                handle_disconnect(
-                    player_id, reason="TimeoutError (30s inactivity)"
-                )
+                chunk = client_socket.recv(1024)
+            except (socket.timeout, TimeoutError):
+                with state_lock:
+                    if game_state["state"] == "GAME_OVER":
+                        break
+                    state = game_state["state"]
+                    waiting_on_player = (
+                        (
+                            state in ("CHOOSE_SHAPE", "IN_PROGRESS")
+                            and game_state["active_turn"] == player_id
+                        )
+                        or (
+                            state == "REMATCH_WAIT"
+                            and player_id not in game_state["rematch_votes"]
+                        )
+                    )
+                    elapsed = (
+                        time.time() - game_state["turn_start_time"]
+                        if game_state["turn_start_time"] > 0
+                        else 0.0
+                    )
+
+                    if waiting_on_player and elapsed >= TURN_TIMEOUT:
+                        print(
+                            f"[SERVER] {player_id} timed out after "
+                            f"{TURN_TIMEOUT:.1f}s."
+                        )
+                        handle_forfeit(
+                            player_id,
+                            "TimeoutError (30s inactivity)",
+                            is_afk=True,
+                        )
+                        break
+                continue
+
+            if not chunk:
+                with state_lock:
+                    if game_state["state"] != "GAME_OVER":
+                        print(f"[SERVER] {player_id} disconnected (EOF).")
+                        handle_forfeit(
+                            player_id,
+                            "Client disconnected unexpectedly",
+                            is_afk=False,
+                        )
                 break
 
-            if messages is None:
-                # 0-byte TCP FIN / EOF detected
-                print(
-                    f"[SERVER] 0-byte EOF received from {player_id} "
-                    f"({client_address})."
+            buffer += chunk.decode("utf-8", errors="replace")
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    send_json(
+                        client_socket,
+                        {
+                            "type": "ERROR",
+                            "message": "Malformed JSON packet received.",
+                        },
+                    )
+                    continue
+
+                with state_lock:
+                    if game_state["state"] != "GAME_OVER":
+                        process_message(player_id, msg)
+
+    except (ConnectionResetError, BrokenPipeError, OSError):
+        with state_lock:
+            if game_state["state"] != "GAME_OVER":
+                print(f"[SERVER] Connection reset by {player_id}.")
+                handle_forfeit(
+                    player_id,
+                    "Connection reset by peer",
+                    is_afk=False,
                 )
-                handle_disconnect(player_id, reason="TCP EOF (0 bytes)")
-                break
-
-            for msg in messages:
-                process_message(player_id, msg)
-                if match_done_event.is_set():
-                    break
-
-    except (
-        ConnectionResetError,
-        ConnectionAbortedError,
-        BrokenPipeError,
-        TimeoutError,
-    ) as exc:
-        print(
-            f"[SERVER] Abrupt connection error from {player_id}: "
-            f"{type(exc).__name__}"
-        )
-        handle_disconnect(player_id, reason=type(exc).__name__)
-    except OSError:
-        pass
+    finally:
+        try:
+            client_socket.close()
+        except OSError:
+            pass
 
 
 def main():
-    """Initializes the TCP listener and runs the lobby accept loop."""
-    global game_state, points, last_loser
-
+    """Main server loop accepting pairs of players for Tic-Tac-Toe matches."""
     args = parse_args()
-    port = args.port
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((IP_ADDR, port))
-    s.listen(2)
-    print(f"[SERVER] Tic-Tac-Toe Server listening on {IP_ADDR}:{port}...")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_sock:
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_sock.bind((IP_ADDR, args.port))
+        server_sock.listen(5)
+        server_sock.settimeout(1.0)
 
-    try:
-        while True:
-            # Transition: INIT / CLEANUP -> WAITING_FOR_PLAYERS
-            with game_lock:
-                game_state = "WAITING_FOR_PLAYERS"
-                points = {"player_1": 0, "player_2": 0}
-                last_loser = None
-                match_done_event.clear()
+        print(
+            f"[SERVER] Tic-Tac-Toe Server listening on "
+            f"{IP_ADDR}:{args.port}..."
+        )
 
-            print(
-                "\n[SERVER] State: WAITING_FOR_PLAYERS "
-                "(Waiting for 2 players to connect...)"
-            )
-
-            # Run connection loop twice to connect both players
+        try:
             while True:
-                with game_lock:
-                    if len(clients) >= 2:
-                        break
-                    assigned_id = (
-                        "player_1"
-                        if "player_1" not in clients
-                        else "player_2"
-                    )
+                with state_lock:
+                    reset_match_state()
+                    match_done_event.clear()
 
-                client_socket, client_address = s.accept()
                 print(
-                    f"[SERVER] Accepted connection from {client_address} "
-                    f"as {assigned_id}"
+                    "\n[SERVER] State: WAITING_FOR_PLAYERS "
+                    "(Waiting for 2 players to connect...)"
                 )
 
-                with game_lock:
-                    clients[assigned_id] = client_socket
-                    client_buffers[assigned_id] = ""
+                threads = []
+                while len(threads) < 2:
+                    try:
+                        conn, addr = server_sock.accept()
+                    except socket.timeout:
+                        continue
 
-                thread = threading.Thread(
-                    target=handle_client,
-                    args=(client_socket, client_address, assigned_id),
-                    daemon=True,
-                )
-                thread.start()
+                    with state_lock:
+                        player_id = f"player_{len(game_state['players']) + 1}"
+                        game_state["players"][player_id] = conn
+                        print(
+                            f"[SERVER] Accepted connection from {addr} "
+                            f"as {player_id}"
+                        )
 
-            # Allow initial CONNECT packets to finish before GAME_START
-            time.sleep(0.2)
-            with game_lock:
-                both_still_connected = len(clients) == 2
+                        if player_id == "player_1":
+                            send_json(
+                                conn,
+                                {
+                                    "type": "LOBBY",
+                                    "player_id": player_id,
+                                    "message": (
+                                        "Successfully connected to server. "
+                                        "Waiting for Player 2..."
+                                    ),
+                                },
+                            )
+                        else:
+                            send_json(
+                                conn,
+                                {
+                                    "type": "LOBBY",
+                                    "player_id": player_id,
+                                    "message": (
+                                        "Successfully connected to server. "
+                                        "Match starting!"
+                                    ),
+                                },
+                            )
+                            start_shape_selection()
 
-            if both_still_connected:
-                start_assignment_phase()
-                match_done_event.wait()
+                    t = threading.Thread(
+                        target=handle_client,
+                        args=(conn, player_id),
+                        daemon=True,
+                    )
+                    t.start()
+                    threads.append(t)
+
+                while not match_done_event.is_set():
+                    time.sleep(0.2)
+
+                for t in threads:
+                    t.join(timeout=2.0)
+
                 print(
                     "[SERVER] Match cleaned up. "
                     "Returning to WAITING_FOR_PLAYERS."
                 )
 
-    except KeyboardInterrupt:
-        print("\n[SERVER] Shutting down server...")
-    finally:
-        with game_lock:
-            cleanup_session_locked()
-        s.close()
+        except KeyboardInterrupt:
+            print("\n[SERVER] Shutting down server gracefully.")
+            sys.exit(0)
 
 
 if __name__ == "__main__":
